@@ -35,12 +35,20 @@ header), so you can ship a prebuilt binary that users just run.
      ~2 s to ~30 s. Shorter reacts faster; longer is steadier (and better for
      dynamics, where you want a representative span).
    - **AG Trim** — manual offset, ±12 dB, applied on top of the learned offset.
-   - **In LUFS** / **Out LUFS** — read-only K-weighted loudness readouts: the dry
-     input and the as-heard output after compensation. They should read roughly
-     equal once matched. These are meters, not controls — they ignore writes and
-     report `canBeAutomated = 0`. How often they visibly refresh depends on the
-     host: DAWs that poll parameter displays while the device panel is open show a
-     live number; others update only when they next re-read the parameter.
+     Displays just its value (e.g. `+0.0 dB`); the loudness readout lives on AG
+     Level below.
+   - **AG Level** — a readout, not a control: its *value* tracks the output
+     loudness, and its display shows In/Out LUFS (e.g. `-14/-14`). A parameter
+     whose value changes is the only thing a host like Bitwig will re-read
+     continuously, so this is the one that updates in **realtime** as the level
+     moves. The plugin also notifies the host (~12 Hz) so non-polling hosts keep
+     it fresh. Writes to it are ignored. A record-armed automation lane on it
+     would capture the movement — harmless unless you deliberately arm it.
+
+> **Bitwig (and other caching hosts):** the parameter layout is cached at scan
+> time. After updating the wrappers, force a rescan — remove and re-add the
+> plugin, or clear/rebuild the plugin cache — or Bitwig will keep showing the old
+> parameter set and **AG Level** won't appear.
 
 **How it behaves.** Because the offset is gated and integrated over the window, it
 handles both static-character processing (EQ, saturation, consoles) and dynamics
@@ -81,7 +89,7 @@ the matching `.cfg`, `LoadLibrary`s the real plugin, and returns an `AEffect` th
   `processDoubleReplacing` (Airwindows' double-precision path is preserved);
 - translates the `audioMaster` callback pointer so host automation still resolves
   to the wrapper, not the hidden inner plugin;
-- appends the three AG parameters and reports `numParams = inner + 3`;
+- appends the four AG parameters (Hold, Window, Trim, Level) and reports `numParams = inner + 4`;
 - wraps the state chunk (`AGW1` header) so the AG settings survive save/reload —
   Airwindows set `programsAreChunks(true)`, so without this the extra params would
   be silently dropped;
