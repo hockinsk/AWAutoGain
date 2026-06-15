@@ -29,12 +29,14 @@
 #endif
 
 // ---- parameters the shim appends after the inner plugin's own ---------------
-// Always auto-matching: a rolling, BS.1770 gated-integrated dry-vs-wet offset is
-// computed continuously and applied. Hold freezes it at the current value.
+// Hold/Window/Trim are controls. AG Level is a readout whose *value* tracks the
+// output loudness — a moving value is the only thing that makes a host like
+// Bitwig re-read a parameter's display, so this is what ticks in realtime. Its
+// display shows In/Out LUFS; the same pair is also embedded in the Trim display.
 static constexpr int K_CTRL  = 3;   // Hold, Window, Trim
-static constexpr int K_METER = 2;   // In LUFS, Out LUFS (read-only readouts)
+static constexpr int K_METER = 1;   // Level (moving readout)
 static constexpr int K_EXTRA = K_CTRL + K_METER;
-enum { P_HOLD = 0, P_WINDOW = 1, P_TRIM = 2, P_INLUFS = 3, P_OUTLUFS = 4 };
+enum { P_HOLD = 0, P_WINDOW = 1, P_TRIM = 2, P_LEVEL = 3 };
 
 // ---- ITU-R BS.1770 K-weighting: two biquads applied before measuring energy,
 //      so "Match" targets perceived loudness (LUFS) rather than flat RMS. For a
@@ -77,6 +79,7 @@ struct Wrap {
     double curGain  = 1.0;     // per-sample-smoothed applied gain
     bool   primed   = false;
     int    dbgAccum = 0;       // sample counter for throttled debug logging
+    int    autoAccum = 0;      // sample counter for throttled audioMasterAutomate
     int    mdry = 2, mwet = 2; // measurement channel counts (for LUFS readout)
 
     // K-weighting filters (coefficients computed once the sample rate is known)
@@ -127,10 +130,18 @@ static inline double linToDb(double lin){ return 20.0 * std::log10(lin); }
 // Window control 0..1 -> seconds of recent audio the rolling gated measure uses.
 static inline double windowSec(float p) { return 2.0 * std::pow(15.0, clampd((double)p, 0.0, 1.0)); } // ~2..30 s
 // Fixed one-pole coefficient for the live LUFS meters (~400 ms).
-static inline double meterCoef(double srate) { return std::exp(-1.0 / (0.4 * (srate > 0 ? srate : 48000.0))); }
+static inline double meterCoef(double srate, int n) {
+    double fs = (srate > 0 ? srate : 48000.0);
+    return std::exp(-(double)(n > 0 ? n : 1) / (0.4 * fs));  // ~400 ms, per processing block
+}
 static inline double trimDb(float p)  { return (clampd(p, 0.0, 1.0) - 0.5) * 24.0; } // +/-12 dB
 
 // =============================== DSP =========================================
+// msToLufs()/lufsToNorm() (defined below) are used by the Level param + display.
+static inline double msToLufs (double msAvg, int nch);
+static inline float  lufsToNorm (double lufs);
+static constexpr int32_t audioMasterAutomate = 0;   // VST2 host opcode
+
 // BS.1770 gated integrated loudness from a list of per-block channel-summed
 // mean squares (zSum). Applies the -70 LUFS absolute gate, then the -10 LU
 // relative gate, exactly as an integrated-LUFS meter does.
@@ -210,11 +221,12 @@ static void processGeneric(Wrap* w, T** in, T** out, int32_t n) {
     double dryMS = dry / (double)(n * mdry);
     double wetMS = wet / (double)(n * mwet);
 
-    // 4) live meters: fixed ~400 ms one-pole, only updated on real signal.
-    const double FLOOR = 1e-9; // ~ -90 dBFS
-    double a = meterCoef(w->srate);
+    // 4) live meters: fixed ~400 ms one-pole, always integrating so the readout
+    //    follows the actual signal (rising with audio, decaying toward the -70
+    //    floor in silence). Display-only; the matching uses separate accumulators.
+    double a = meterCoef(w->srate, n);
     if (!w->primed) { w->smDry = dryMS; w->smWet = wetMS; w->primed = true; }
-    if (dryMS > FLOOR && wetMS > FLOOR) {
+    else {
         w->smDry = a * w->smDry + (1.0 - a) * dryMS;
         w->smWet = a * w->smWet + (1.0 - a) * wetMS;
     }
@@ -279,6 +291,17 @@ static void processGeneric(Wrap* w, T** in, T** out, int32_t n) {
         for (int c = 0; c < nout; ++c) out[c][i] = (T)((double)out[c][i] * g);
     }
     w->curGain = g;
+
+    // 7) Notify the host (~12 Hz) that the Level readout moved, so hosts that
+    //    don't poll still re-read its display. Level's value genuinely changes
+    //    with loudness, so unlike re-asserting Trim this isn't deduped away.
+    w->autoAccum += n;
+    if (w->hostCb && w->autoAccum >= (int)(w->srate / 12.0)) {
+        w->autoAccum = 0;
+        int innerN = w->inner->numParams;
+        double outL = msToLufs(w->smWet, w->mwet) + linToDb(w->curGain);
+        w->hostCb(&w->outer, audioMasterAutomate, innerN + P_LEVEL, 0, nullptr, lufsToNorm(outL));
+    }
 }
 
 static void procRepl  (AEffect* e, float**  in, float**  out, int32_t n) {
@@ -294,9 +317,9 @@ static inline double msToLufs(double msAvg, int nch) {
     double zSum = msAvg * (nch > 0 ? nch : 1);    // BS.1770 sums channels
     return -0.691 + 10.0 * std::log10(zSum + 1e-30);
 }
-// Map a LUFS value onto a 0..1 slider over a -60..0 LUFS window.
+// Map a LUFS value onto a 0..1 slider over a -70..0 LUFS window (for the Level param).
 static inline float lufsToNorm(double lufs) {
-    return (float)clampd((lufs + 60.0) / 60.0, 0.0, 1.0);
+    return (float)clampd((lufs + 70.0) / 70.0, 0.0, 1.0);
 }
 
 static void setParam(AEffect* e, int32_t idx, float v) {
@@ -307,7 +330,6 @@ static void setParam(AEffect* e, int32_t idx, float v) {
         case P_HOLD:   w->pHold   = v; break;
         case P_WINDOW: w->pWindow = v; break;
         case P_TRIM:   w->pTrim   = v; break;
-        // P_INLUFS / P_OUTLUFS are read-only meters: ignore writes.
     }
 }
 static float getParam(AEffect* e, int32_t idx) {
@@ -318,8 +340,7 @@ static float getParam(AEffect* e, int32_t idx) {
         case P_HOLD:    return w->pHold;
         case P_WINDOW:  return w->pWindow;
         case P_TRIM:    return w->pTrim;
-        case P_INLUFS:  return lufsToNorm(msToLufs(w->smDry, w->mdry));
-        case P_OUTLUFS: return lufsToNorm(msToLufs(w->smWet, w->mwet) + linToDb(w->curGain));
+        case P_LEVEL:   return lufsToNorm(msToLufs(w->smWet, w->mwet) + linToDb(w->curGain));
     }
     return 0.0f;
 }
@@ -344,13 +365,13 @@ static VstIntPtr dispatch(AEffect* e, int32_t op, int32_t idx, VstIntPtr val, vo
     // ---- queries about OUR appended parameters --------------------------------
     case effGetParamName:
         if (extra >= 0) {
-            const char* n[] = { "AG Hold", "AG Window", "AG Trim", "In LUFS", "Out LUFS" };
+            const char* n[] = { "AG Hold", "AG Window", "AG Trim", "AG Level" };
             copyStr(ptr, n[extra]); return 1;
         }
         break;
     case effGetParamLabel:
         if (extra >= 0) {
-            const char* l[] = { "", "s", "dB", "LUFS", "LUFS" };
+            const char* l[] = { "", "s", "dB", "" };   // AG Level carries "LUFS" in its display
             copyStr(ptr, l[extra]); return 1;
         }
         break;
@@ -362,14 +383,21 @@ static VstIntPtr dispatch(AEffect* e, int32_t op, int32_t idx, VstIntPtr val, vo
                 else                  std::snprintf(buf, sizeof buf, "Auto %+.1f dB", w->learnedDb);
             }
             else if (extra == P_WINDOW) std::snprintf(buf, sizeof buf, "%.1f s", windowSec(w->pWindow));
-            else if (extra == P_TRIM)   std::snprintf(buf, sizeof buf, "%+.1f", trimDb(w->pTrim));
-            else if (extra == P_INLUFS) std::snprintf(buf, sizeof buf, "%.1f", msToLufs(w->smDry, w->mdry));
-            else /* P_OUTLUFS */        std::snprintf(buf, sizeof buf, "%.1f", msToLufs(w->smWet, w->mwet) + linToDb(w->curGain));
+            else if (extra == P_TRIM) std::snprintf(buf, sizeof buf, "%+.1f", trimDb(w->pTrim));
+            else /* P_LEVEL */ {
+                // Moving readout: value tracks output loudness, so hosts re-read
+                // this display live. Shows In/Out LUFS (1 dp), floored at -70.
+                double inL  = msToLufs(w->smDry, w->mdry);
+                double outL = msToLufs(w->smWet, w->mwet) + linToDb(w->curGain);
+                if (inL  < -70.0) inL  = -70.0;
+                if (outL < -70.0) outL = -70.0;
+                std::snprintf(buf, sizeof buf, "%.1f/%.1f LUFS", inL, outL);
+            }
             copyStr(ptr, buf); return 1;
         }
         break;
     case effCanBeAutomated:
-        if (extra >= 0) return extra < K_CTRL ? 1 : 0;   // meters are read-only
+        if (extra >= 0) return 1;   // report all appended params automatable (so meters can show)
         break;
     case effGetParameterProperties:
         if (extra >= 0) return 0; // let host use defaults for our params
